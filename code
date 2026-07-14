@@ -1,0 +1,196 @@
+"""
+专利基础领域分类脚本
+使用 PatentBERT (PatentSBERTa) 对专利标题+摘要进行向量化，
+通过与产业五基技术描述向量的余弦相似度匹配，判断每件专利所属的基础领域。
+相似度阈值：0.85
+"""
+
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"   # ← 添加这一行
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import pandas as pd
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========================
+# 1. 配置参数
+# ==========================
+EXCEL_PATH = r"d:\学习\论文\机器人产业链\数据\智能关键技术与专利分类号.xlsx"
+CSV_PATH = r"d:\学习\论文\机器人产业链\数据\专利数据\专利_合并结果.csv"
+OUTPUT_PATH = r"d:\学习\论文\机器人产业链\数据\专利数据\专利_合并结果.csv"
+LOG_PATH = r"d:\学习\论文\机器人产业链\数据\专利数据\run_log.txt"
+
+# 同时输出到文件和控制台
+import sys
+class Tee:
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+            f.flush()
+    def flush(self):
+        for f in self.files:
+            f.flush()
+log_file = open(LOG_PATH, 'w', encoding='utf-8')
+sys.stdout = Tee(sys.stdout, log_file)
+sys.stderr = Tee(sys.stderr, log_file)
+
+# PatentBERT 模型（针对专利文本微调的 Sentence-BERT）
+MODEL_NAME = "AI-Growth-Lab/PatentSBERTa"
+SIMILARITY_THRESHOLD = 0.85
+BATCH_SIZE = 256  # 批量编码大小（GPU 上增大 batch 以充分利用并行能力）
+MAX_SEQ_LENGTH = 512  # 最大序列长度
+USE_FP16 = True  # 混合精度推理，大幅加速 + 省显存
+
+# ==========================
+# 2. 加载模型
+# ==========================
+print("正在加载 PatentBERT 模型...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"使用设备: {device}")
+
+model = SentenceTransformer(MODEL_NAME, device=device)
+model.max_seq_length = MAX_SEQ_LENGTH
+
+# GPU 加速：开启混合精度推理（FP16），速度翻倍 + 显存减半
+if USE_FP16 and device == "cuda":
+    model.half()  # 模型权重转为 float16
+    print("已启用 FP16 混合精度推理。")
+
+print("模型加载完成。\n")
+
+# ==========================
+# 3. 读取技术描述（Excel）
+# ==========================
+print("读取技术描述文件...")
+tech_df = pd.read_excel(EXCEL_PATH)
+print(f"共 {len(tech_df)} 条技术描述")
+print(f"基础领域类别: {tech_df['基础领域'].unique().tolist()}\n")
+
+# 构建技术描述文本（产品和技术名称 + 技术描述）
+tech_df['full_desc'] = tech_df['产品和技术名称'].fillna('') + "：" + tech_df['技术描述'].fillna('')
+tech_texts = tech_df['full_desc'].tolist()
+tech_labels = tech_df['基础领域'].tolist()
+
+# 显示所有技术描述
+for i, (name, label) in enumerate(zip(tech_df['产品和技术名称'], tech_df['基础领域'])):
+    print(f"  [{i}] {name} → {label}")
+
+# ==========================
+# 4. 读取专利数据（CSV）
+# ==========================
+print(f"\n读取专利数据文件...")
+patent_df = pd.read_csv(CSV_PATH, dtype=str)
+total = len(patent_df)
+print(f"共 {total} 条专利记录")
+
+# 构造标题+摘要文本
+patent_df['标题摘要'] = patent_df['专利标题'].fillna('') + "。" + patent_df['摘要'].fillna('')
+# 处理空文本
+patent_df['标题摘要'] = patent_df['标题摘要'].str.strip()
+empty_mask = patent_df['标题摘要'].isin(['', '。', '.'])
+print(f"其中标题和摘要均为空的记录数: {empty_mask.sum()}")
+
+patent_texts = patent_df['标题摘要'].tolist()
+
+# ==========================
+# 5. 向量化
+# ==========================
+print("\n正在向量化技术描述...")
+tech_embeddings = model.encode(
+    tech_texts,
+    normalize_embeddings=True,
+    show_progress_bar=True,
+    batch_size=BATCH_SIZE,
+    convert_to_tensor=True,           # 返回 GPU tensor（如果模型在 GPU 上）
+)
+print(f"技术描述向量维度: {tech_embeddings.shape}")
+
+print("\n正在向量化专利标题摘要（这可能需要一段时间）...")
+patent_embeddings = model.encode(
+    patent_texts,
+    normalize_embeddings=True,
+    show_progress_bar=True,
+    batch_size=BATCH_SIZE,
+    convert_to_tensor=True,
+)
+print(f"专利向量维度: {patent_embeddings.shape}")
+
+# ==========================
+# 6. 相似度计算与匹配
+# ==========================
+print("\n正在计算余弦相似度...")
+# 如果向量在 GPU 上，先移到 CPU 再转为 numpy
+if isinstance(patent_embeddings, torch.Tensor):
+    patent_embeddings_np = patent_embeddings.cpu().numpy()
+    tech_embeddings_np = tech_embeddings.cpu().numpy()
+else:
+    patent_embeddings_np = patent_embeddings
+    tech_embeddings_np = tech_embeddings
+
+# 分批计算相似度以避免内存溢出
+num_patents = len(patent_embeddings_np)
+all_best_labels = []
+all_best_scores = []
+all_best_indices = []
+
+for start in range(0, num_patents, 5000):
+    end = min(start + 5000, num_patents)
+    batch = patent_embeddings_np[start:end]
+    sim = cosine_similarity(batch, tech_embeddings_np)  # (batch, 8)
+
+    # 对每条专利取最高相似度及其索引
+    best_idx = np.argmax(sim, axis=1)
+    best_score = np.max(sim, axis=1)
+
+    all_best_indices.extend(best_idx.tolist())
+    all_best_scores.extend(best_score.tolist())
+
+# 根据阈值确定标签
+result_labels = []
+result_scores = []
+for i in range(num_patents):
+    score = all_best_scores[i]
+    if score >= SIMILARITY_THRESHOLD:
+        result_labels.append(tech_labels[all_best_indices[i]])
+    else:
+        result_labels.append("未匹配")
+    result_scores.append(round(score, 6))
+
+# ==========================
+# 7. 保存结果
+# ==========================
+print("\n正在保存结果...")
+
+# 统计
+label_counts = pd.Series(result_labels).value_counts()
+print("\n===== 匹配结果统计 =====")
+for label, count in label_counts.items():
+    pct = count / total * 100
+    print(f"  {label}: {count} 件 ({pct:.1f}%)")
+
+matched_count = total - label_counts.get("未匹配", 0)
+print(f"\n匹配成功（≥{SIMILARITY_THRESHOLD}）: {matched_count}/{total} ({matched_count/total*100:.1f}%)")
+
+# 添加结果列
+patent_df['基础领域匹配'] = result_labels
+patent_df['匹配相似度'] = result_scores
+
+# 匹配到的具体技术名称
+tech_name_map = {i: name for i, name in enumerate(tech_df['产品和技术名称'].tolist())}
+patent_df['匹配技术名称'] = [
+    tech_name_map.get(idx, "") if label != "未匹配" else ""
+    for idx, label in zip(all_best_indices, result_labels)
+]
+
+# 保存CSV
+patent_df.to_csv(OUTPUT_PATH, index=False, encoding='utf-8-sig')
+print(f"\n结果已保存到: {OUTPUT_PATH}")
+print("新增列: 基础领域匹配, 匹配相似度, 匹配技术名称")
+print("完成！")
